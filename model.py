@@ -438,7 +438,7 @@ class RLHF(nn.Module):
         else:
             return self.model(idx, targets)
      
-    def generate(self, idx, max_new_tokens, device, block_size, use_reference=True, reward_model=None, hard_code_reward=True, critic_model=None):
+    def generate(self, idx, max_new_tokens, device, block_size, use_reference=True, reference_model=None):
         # idx is (B, T) array of indices in the current context
         log_probs = torch.tensor([]).to(device)
         log_probs_ref = torch.tensor([]).to(device)
@@ -462,7 +462,6 @@ class RLHF(nn.Module):
             log_probs_idx_next = m.log_prob(idx_next)    
             log_probs = torch.cat((log_probs, log_probs_idx_next.view(-1,1)), dim=1)
             # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next.view(-1,1)), dim=1) # (B, T+1)
             # entropy = m.entropy()
 
             # probs_next = F.softmax(logits, dim=-1) # (B, C)
@@ -474,14 +473,22 @@ class RLHF(nn.Module):
             # idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
           
             if use_reference:
-                logits_ref, _ = self.model(idx_cond)
+                logits_ref, _ = reference_model(idx_cond)
                 logits_ref = logits_ref[:, -1, :] # becomes (B, C)
-                probs_ref_next = F.softmax(logits_ref, dim=-1) # (B, C)
-                probs_ref_idx_next = torch.gather(probs_ref_next, 1, idx_next)
-                log_probs_ref_idx_next = torch.log(probs_ref_idx_next)
-                log_probs_ref = torch.cat((log_probs_ref, log_probs_ref_idx_next), dim=1)
+                
+                # probs_ref_next = F.softmax(logits_ref, dim=-1) # (B, C)
+                # probs_ref_idx_next = torch.gather(probs_ref_next, 1, idx_next)
+                # log_probs_ref_idx_next = torch.log(probs_ref_idx_next)
+                # log_probs_ref = torch.cat((log_probs_ref, log_probs_ref_idx_next), dim=1)
+                
+                m_ref = Categorical(logits=logits_ref)
+                log_probs_ref_idx_next = m_ref.log_prob(idx_next)    
+                log_probs_ref = torch.cat((log_probs_ref, log_probs_ref_idx_next.view(-1,1)), dim=1)
+                # append sampled index to the running sequence
+        
+            idx = torch.cat((idx, idx_next.view(-1,1)), dim=1) # (B, T+1)
 
-        return idx, log_probs[:,-max_new_tokens:], log_probs_ref
+        return idx, log_probs, log_probs_ref
     
     def generate_gumbel(self, idx, max_new_tokens, device, block_size, reward_model, use_reference=True):
         

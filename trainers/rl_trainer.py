@@ -85,10 +85,12 @@ class PolicyGradientTrainer(Trainer):
             gamma = 1
             lam = 1
             
-            states, log_probs, log_probs_reference = model.generate(
-                X, max_new_tokens, self.device, self.block_size, use_reference=False)
+            states, log_probs, log_probs_ref = model.generate(
+                X, max_new_tokens, self.device, self.block_size, use_reference=True, reference_model=critic_model)
             
             states = states[:,-max_new_tokens:]
+            log_probs = log_probs[:,-max_new_tokens:]
+            log_probs_ref = log_probs_ref[:,-max_new_tokens:]
 
             text = []
             for i, s in enumerate(states):
@@ -100,7 +102,9 @@ class PolicyGradientTrainer(Trainer):
                 
             # text = [self.enc.decode(s.tolist()) for s in states]
             sent = sentiment_pipeline(text)
-            rewards = torch.tensor([a['label']=='POSITIVE' for a in sent],dtype=torch.float16).unsqueeze(-1).to(self.device)
+            pos_labels = torch.tensor([a['label']=='POSITIVE' for a in sent],dtype=torch.float16).unsqueeze(-1).to(self.device)
+            weights = torch.tensor([a['score'] for a in sent],dtype=torch.float32).unsqueeze(-1).to(self.device)
+            rewards = pos_labels * weights**3
             # print(sent)
 
             # if self.config['hard_code_reward']: 
@@ -115,8 +119,8 @@ class PolicyGradientTrainer(Trainer):
             #     else:
             #         rewards = reward_model.forward_reward(states)
             
-            values = critic_model.forward_value(states).squeeze()
-            # values = torch.zeros_like(states, dtype=torch.float16)
+            # values = critic_model.forward_value(states).squeeze()
+            values = torch.zeros_like(states, dtype=torch.float16)
             
             for t in reversed(range(max_new_tokens)):
                 if t == max_new_tokens - 1:
@@ -132,7 +136,8 @@ class PolicyGradientTrainer(Trainer):
 
             # minus KL divergence
             # if iter > 1000:
-            pg = advantages * log_probs.squeeze() #- 1*(log_probs-log_probs_reference) #- 0.05*log_probs
+            # pg = advantages * log_probs.squeeze() - 0.1*(log_probs-log_probs_ref) #- 0.05*log_probs
+            pg = (advantages + 0.2*log_probs_ref-0.05*log_probs)* log_probs.squeeze()
             actor_loss = -pg.sum()
             actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward(retain_graph=True)
@@ -140,26 +145,28 @@ class PolicyGradientTrainer(Trainer):
             # else:
             #     actor_loss = None
 
-            critic_loss = torch.mean((returns-values)**2)
-            critic_optimizer.zero_grad(set_to_none=True)
-            critic_loss.backward()
-            critic_optimizer.step()
+            # critic_loss = torch.mean((returns-values)**2)
+            # critic_optimizer.zero_grad(set_to_none=True)
+            # critic_loss.backward()
+            # critic_optimizer.step()
+            critic_loss = None
 
             torch.mean(rewards)
 
             rews_all.append(rewards.mean().detach().cpu().numpy())
-
-            if iter % 1000 == 0:
+            
+            eval_interval = self.config['eval_interval']
+            if iter % eval_interval == 0:
                 t1 = time.time()
                 print(f'iter: {iter}, time: {t1-t0}')
                 # print(actor_loss, critic_loss)
                 print(f'Actor loss: {actor_loss}, iter: {iter}')
                 print(f'Critic loss: {critic_loss}')
-                print(f'rets: {np.mean(rews_all[-1000:])}')
+                print(f'rets: {np.mean(rews_all[-eval_interval:])}')
                 current_time = time.time()
                 # print(current_time - last_time)
                 last_time = current_time
-                text = model.generate(X, self.block_size, self.device, self.block_size, reward_model=reward_model, use_reference=False)[0]
+                text = model.generate(X, self.block_size, self.device, self.block_size, use_reference=False)[0]
                 for i in range(1):
                     text_i = text[i,:]
                     # print(reward(text_i))

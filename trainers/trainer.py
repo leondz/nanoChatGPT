@@ -246,6 +246,7 @@ class Trainer():
         self.setup_ddp()
 
         ctx, meta_vocab_size = self.setup()
+        self.meta_vocab_size = 50257
 
         # model init
         model = self.init_model()
