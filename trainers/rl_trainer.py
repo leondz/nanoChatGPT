@@ -5,6 +5,7 @@ from torch.distributed import destroy_process_group
 import time, os
 from model import RLHF
 from trainers.trainer import Trainer
+from transformers import pipeline
 
 # TODO: this works but is currently crude and incomplete, critic implementation plus PPO are obvious next steps
 class PolicyGradientTrainer(Trainer):
@@ -19,6 +20,8 @@ class PolicyGradientTrainer(Trainer):
         self.setup_ddp()
 
         ctx, meta_vocab_size = self.setup()
+
+        self.meta_vocab_size = 50257
 
         # model init
         model = self.init_model()
@@ -42,14 +45,13 @@ class PolicyGradientTrainer(Trainer):
                         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
                 model.load_state_dict(state_dict)
 
-        
+        import copy
         if self.config['hard_code_reward']:
             reward_model = None
             print('Using hard-coded reward')
         else:
             print('Using learned reward model')
             if self.config['separate_reward_model']:
-                import copy
                 reward_model = copy.deepcopy(model)
                 print('Reward model instantiated separately')
             else:
@@ -58,26 +60,90 @@ class PolicyGradientTrainer(Trainer):
             reward_model.to(self.device)
         
         model.to(self.device)
+
+        critic_model = copy.deepcopy(model)
+        critic_model.to(self.device)
         
         # actor_optimizer = torch.optim.AdamW(model.model.policy_head.parameters(), lr=1e-2)
         actor_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        critic_optimizer = torch.optim.AdamW(critic_model.parameters(), lr=1e-3)
 
         last_time = time.time()
         rews_all = []
         max_iters = 100000
         X, Y = self.get_batch('train') # fetch the very first batch
+        X = torch.zeros((X.shape[0], 1), dtype=torch.long).to(self.device) # for now there is no prompt
         t0  = time.time()
+        max_new_tokens = self.block_size
+
+        sentiment_pipeline = pipeline("sentiment-analysis")
+
+
         for iter in range(max_iters):
+            advantages = torch.zeros((X.shape[0], max_new_tokens)).to(self.device)
+            returns = torch.zeros((X.shape[0], max_new_tokens)).to(self.device)
+            gamma = 1
+            lam = 1
             
-            states, log_probs, log_probs_reference, rewards, advantages = model.generate(
-                X, self.block_size, self.device, self.block_size, reward_model=reward_model, hard_code_reward=self.config['hard_code_reward'])
+            states, log_probs, log_probs_reference = model.generate(
+                X, max_new_tokens, self.device, self.block_size, use_reference=False)
+            
+            states = states[:,-max_new_tokens:]
+
+            text = []
+            for i, s in enumerate(states):
+                try:
+                    te = self.enc.decode(s.tolist())
+                except:
+                    te = 'sad terrible'
+                text.append(te)
+                
+            # text = [self.enc.decode(s.tolist()) for s in states]
+            sent = sentiment_pipeline(text)
+            rewards = torch.tensor([a['label']=='POSITIVE' for a in sent],dtype=torch.float16).unsqueeze(-1).to(self.device)
+            # print(sent)
+
+            # if self.config['hard_code_reward']: 
+            #     # simple test where reward for outputting the letter 'z' (89)
+            #     rewards = torch.zeros_like(states, dtype=torch.float16)
+            #     rewards[states==89] = 1.0
+            #     rewards = torch.sum(rewards, 1, keepdim=True)
+            #     rewards[rewards > 1] = 1
+            # else:
+            #     if self.discrete_reward:
+            #         rewards = reward_model.forward_reward(states)[0][:,1].unsqueeze(-1)
+            #     else:
+            #         rewards = reward_model.forward_reward(states)
+            
+            values = critic_model.forward_value(states).squeeze()
+            # values = torch.zeros_like(states, dtype=torch.float16)
+            
+            for t in reversed(range(max_new_tokens)):
+                if t == max_new_tokens - 1:
+                    # value at last state is 0
+                    delta = rewards[:].squeeze() - values[:, t]
+                    advantages[:, t] = delta
+                    returns[:, t] = rewards[:].squeeze()
+                else:
+                    # rewards can only be non-zero at the last state
+                    delta = gamma * values[:, t + 1] - values[:, t]
+                    advantages[:, t] = delta + gamma * lam * advantages[:, t + 1]
+                    returns[:, t] += gamma * returns[:, t + 1]
 
             # minus KL divergence
-            rets = advantages * log_probs.squeeze() #- 1*(log_probs-log_probs_reference) #- 0.05*log_probs
-            actor_loss = -rets.sum()
+            # if iter > 1000:
+            pg = advantages * log_probs.squeeze() #- 1*(log_probs-log_probs_reference) #- 0.05*log_probs
+            actor_loss = -pg.sum()
             actor_optimizer.zero_grad(set_to_none=True)
-            actor_loss.backward()
+            actor_loss.backward(retain_graph=True)
             actor_optimizer.step()
+            # else:
+            #     actor_loss = None
+
+            critic_loss = torch.mean((returns-values)**2)
+            critic_optimizer.zero_grad(set_to_none=True)
+            critic_loss.backward()
+            critic_optimizer.step()
 
             torch.mean(rewards)
 
@@ -88,11 +154,12 @@ class PolicyGradientTrainer(Trainer):
                 print(f'iter: {iter}, time: {t1-t0}')
                 # print(actor_loss, critic_loss)
                 print(f'Actor loss: {actor_loss}, iter: {iter}')
+                print(f'Critic loss: {critic_loss}')
                 print(f'rets: {np.mean(rews_all[-1000:])}')
                 current_time = time.time()
                 # print(current_time - last_time)
                 last_time = current_time
-                text = model.generate(X, self.block_size, self.device, self.block_size, reward_model=reward_model)[0]
+                text = model.generate(X, self.block_size, self.device, self.block_size, reward_model=reward_model, use_reference=False)[0]
                 for i in range(1):
                     text_i = text[i,:]
                     # print(reward(text_i))

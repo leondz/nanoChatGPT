@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.distributions import Categorical
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
@@ -383,6 +384,8 @@ class RLHF(nn.Module):
             model.reward_head = nn.Linear(model.lm_head.in_features, 2, bias=False)
         else:
             model.reward_head = nn.Linear(self.n_embd*self.block_size, 1, bias=False)
+
+        model.value_head = nn.Linear(model.lm_head.in_features, 1, bias=False)
     
     def forward_reward(self, idx, targets=None):
         device = idx.device
@@ -411,28 +414,35 @@ class RLHF(nn.Module):
         else:
             return rewards
     
+    def forward_value(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+
+        # forward the GPT model itself
+        tok_emb = self.model.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.model.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = self.model.transformer.drop(tok_emb + pos_emb)
+        for block in self.model.transformer.h:
+            x = block(x)
+        x = self.model.transformer.ln_f(x)
+        values = self.model.value_head(x)
+
+        return values
+    
+    
     def forward(self, idx, targets=None):
         if self.mode == 'reward':
             return self.forward_reward(idx, targets)
         else:
             return self.model(idx, targets)
      
-    def generate(self, idx, max_new_tokens, device, block_size, use_reference=True, reward_model=None, hard_code_reward=True):
+    def generate(self, idx, max_new_tokens, device, block_size, use_reference=True, reward_model=None, hard_code_reward=True, critic_model=None):
         # idx is (B, T) array of indices in the current context
         log_probs = torch.tensor([]).to(device)
         log_probs_ref = torch.tensor([]).to(device)
-        values = torch.tensor([]).to(device)
-
-        idx_cond_all = torch.zeros((idx.shape[0], block_size, max_new_tokens)).to(device)
-        values_all = torch.zeros((idx.shape[0], max_new_tokens)).to(device)
-        actions_all = torch.zeros((idx.shape[0], max_new_tokens)).to(device)
-        rewards_all = torch.zeros((idx.shape[0],)).to(device)
         log_probs_all = torch.zeros((idx.shape[0], max_new_tokens)).to(device)
-        advantages_all = torch.zeros((idx.shape[0], max_new_tokens)).to(device)
-        returns_all = torch.zeros((idx.shape[0], max_new_tokens)).to(device)
-        gamma = 1
-        lam = 1
-
         # TODO: Critic, PPO
         for i in range(max_new_tokens):
             # crop idx to the last block_size tokens
@@ -446,14 +456,23 @@ class RLHF(nn.Module):
             logits = logits[:, -1, :] # becomes (B, C)
             # apply softmax to get probabilities
             
-            probs_next = F.softmax(logits, dim=-1) # (B, C)
             # sample from the distribution
-            idx_next = torch.multinomial(probs_next, num_samples=1) # (B, 1)
+            m = Categorical(logits=logits)
+            idx_next = m.sample()
+            log_probs_idx_next = m.log_prob(idx_next)    
+            log_probs = torch.cat((log_probs, log_probs_idx_next.view(-1,1)), dim=1)
+            # append sampled index to the running sequence
+            idx = torch.cat((idx, idx_next.view(-1,1)), dim=1) # (B, T+1)
+            # entropy = m.entropy()
 
-            probs_idx_next = torch.gather(probs_next, 1, idx_next)
-            log_probs_idx_next = torch.log(probs_idx_next)
-            log_probs = torch.cat((log_probs, log_probs_idx_next), dim=1)
-            
+            # probs_next = F.softmax(logits, dim=-1) # (B, C)
+            # idx_next = torch.multinomial(probs_next, num_samples=1) # (B, 1)
+            # probs_idx_next = torch.gather(probs_next, 1, idx_next)
+            # log_probs_idx_next = torch.log(probs_idx_next)
+            # log_probs = torch.cat((log_probs, log_probs_idx_next), dim=1)
+            # # append sampled index to the running sequence
+            # idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+          
             if use_reference:
                 logits_ref, _ = self.model(idx_cond)
                 logits_ref = logits_ref[:, -1, :] # becomes (B, C)
@@ -461,42 +480,8 @@ class RLHF(nn.Module):
                 probs_ref_idx_next = torch.gather(probs_ref_next, 1, idx_next)
                 log_probs_ref_idx_next = torch.log(probs_ref_idx_next)
                 log_probs_ref = torch.cat((log_probs_ref, log_probs_ref_idx_next), dim=1)
-            
-            # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-            
 
-            if i == max_new_tokens-1:
-                states = idx[:,-max_new_tokens:]
-                if hard_code_reward: 
-                    # simple test where reward for outputting the letter 'z' (89)
-                    rewards = torch.zeros_like(states, dtype=torch.float16)
-                    rewards[states==89] = 1.0
-                    rewards = torch.sum(rewards, 1, keepdim=True)
-                    rewards[rewards > 1] = 1
-
-                else:
-                    if self.discrete_reward:
-                        rewards = reward_model.forward_reward(torch.tensor(states))[0][:,1].unsqueeze(-1)
-                    else:
-                        rewards = reward_model.forward_reward(torch.tensor(states))
-                    
-
-                for t in reversed(range(max_new_tokens)):
-                    if t == max_new_tokens - 1:
-                        # value at last state is 0
-                        delta = rewards[:].squeeze() - values_all[:, t]
-                        advantages_all[:, t] = delta
-                        # returns_all[:, t] = rewards[:]
-                    else:
-                        # rewards can only be non-zero at the last state
-                        delta = gamma * values_all[:, t + 1] - values_all[:, t]
-                        advantages_all[:, t] = delta + gamma * lam * advantages_all[:, t + 1]
-                        # returns_all[:, t] += gamma * returns_all[:, t + 1]
-
-                    
-            
-        return idx, log_probs[:,-max_new_tokens:], log_probs_ref[:,-max_new_tokens:], rewards, advantages_all
+        return idx, log_probs[:,-max_new_tokens:], log_probs_ref
     
     def generate_gumbel(self, idx, max_new_tokens, device, block_size, reward_model, use_reference=True):
         
